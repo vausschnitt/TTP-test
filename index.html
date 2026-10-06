@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FloodRoute – Kampar prototype</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+*{box-sizing:border-box}body{margin:0;font:14px system-ui,sans-serif;display:flex;height:100vh;color:#1a1a1a}
+#side{width:340px;padding:12px;overflow:auto;border-right:1px solid #ddd;background:#fafafa}
+#map{flex:1}h1{font-size:18px;margin:0 0 2px}h2{font-size:14px;margin:14px 0 6px}
+select,button,input{width:100%;padding:6px;margin:3px 0;font:inherit}
+button{background:#0b6bcb;color:#fff;border:0;border-radius:4px;cursor:pointer}
+.box{padding:8px;border-radius:4px;margin:6px 0;font-size:13px}
+.ok{background:#e3f4e5}.warn{background:#fff3cd}.bad{background:#fde2e2}.info{background:#e7eefb}
+table{width:100%;border-collapse:collapse;font-size:12px}td,th{border-bottom:1px solid #ddd;padding:3px;text-align:left}
+.tag{padding:1px 6px;border-radius:8px;color:#fff;font-size:11px}
+@media(max-width:700px){body{flex-direction:column-reverse}#side{width:100%;height:50%}}
+</style></head><body>
+<div id="side">
+<h1>FloodRoute</h1><div style="color:#666">Kampar study area (demo graph)</div>
+<div id="met" class="box info">MET warning: loading…</div>
+<label><input type="checkbox" id="sim" style="width:auto"> Simulate MET flood/heavy-rain warning</label>
+
+<h2>1. Route</h2>
+<select id="from"></select><select id="to"></select>
+<button id="go">Find route</button>
+<div id="result"></div>
+
+<h2>2. Submit flood report</h2>
+<select id="rroad"></select>
+<select id="rstat"><option>PASSABLE</option><option>CAUTION</option><option>FLOODED</option></select>
+<input id="rlvl" type="number" step="0.1" placeholder="Water level (m)">
+<input id="rby" placeholder="Reported by" value="User01">
+<button id="rsub">Submit report</button>
+
+<h2>3. Admin dashboard</h2>
+<div id="stats"></div>
+<table><thead><tr><th>Time</th><th>Road</th><th>Status</th><th>m</th></tr></thead><tbody id="log"></tbody></table>
+<button id="reset" style="background:#777;margin-top:8px">Reset demo data</button>
+<p style="font-size:12px;color:#777">Routes are decision support only, not guaranteed safe. Depends on freshness of reports.</p>
+</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ---------- ROAD GRAPH (illustrative coords: replace with real Kampar junctions) ----------
+const N={1:["UTAR Kampar",4.3385,101.1385],2:["North Jct",4.3300,101.1450],3:["Kampar Town",4.3053,101.1520],
+4:["Bus Terminal",4.3030,101.1560],5:["Hospital Jct",4.3110,101.1480],6:["West Jct",4.3200,101.1380],
+7:["Old Town",4.3000,101.1500],8:["South Jct",4.2920,101.1530],9:["Bandar Baru",4.3150,101.1600],
+10:["East Jct",4.3220,101.1560],11:["Industrial",4.3080,101.1380],12:["Perak Rd Jct",4.2950,101.1420]};
+// [a, b, name, lowLying]
+const E=[[1,2,"Jln Univ",0],[2,6,"Jln West",0],[2,10,"Jln East",0],[6,11,"Jln Ind 1",0],[11,5,"Jln Hospital",0],
+[5,3,"Jln Kampar (low)",1],[10,5,"Jln Link",0],[10,9,"Jln Baru",0],[9,4,"Jln Terminal",0],[3,4,"Jln Pasar",0],
+[3,7,"Jln Lama (low)",1],[7,8,"Jln South",0],[7,12,"Jln Sungai (low)",1],[11,12,"Jln Ind 2 (low)",1],[12,8,"Jln Selatan",0],[4,8,"Jln Bypass",0]];
+const COL={PASSABLE:"#2e9e44",CAUTION:"#e0a100",FLOODED:"#d32f2f"},MULT={PASSABLE:1,CAUTION:3,FLOODED:Infinity};
+const km=(a,b)=>{const r=Math.PI/180,x=(N[b][2]-N[a][2])*r*Math.cos(N[a][1]*r),y=(N[b][1]-N[a][1])*r;return 6371*Math.hypot(x,y)};
+E.forEach(e=>{e.id=e[0]+"-"+e[1];e.d=km(e[0],e[1])});
+
+// ---------- STATE ----------
+let S;const KEY="floodroute_v1";
+const seed=()=>({st:{"5-3":"FLOODED"},log:[{t:new Date().toISOString(),road:"5-3",s:"FLOODED",l:0.8,by:"Seed"}]});
+try{S=JSON.parse(localStorage.getItem(KEY))}catch(e){}if(!S)S=seed();
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}};
+let metActive=false;
+const status=e=>{let s=S.st[e.id]||"PASSABLE";
+  if(s==="PASSABLE"&&e[3]&&(metActive||sim.checked))s="CAUTION"; // regional warning raises risk on low-lying roads
+  return s};
+
+// ---------- ROUTING (Dijkstra) ----------
+function dijkstra(src,dst,aware){
+  const dist={},prev={},done={};Object.keys(N).forEach(k=>dist[k]=Infinity);dist[src]=0;
+  while(true){let u=null;for(const k in dist)if(!done[k]&&(u===null||dist[k]<dist[u]))u=k;
+    if(u===null||dist[u]===Infinity)break;if(u==dst)break;done[u]=1;
+    for(const e of E){let v=e[0]==u?e[1]:e[1]==u?e[0]:null;if(v===null)continue;
+      const c=e.d*(aware?MULT[status(e)]:1);if(dist[u]+c<dist[v]){dist[v]=dist[u]+c;prev[v]=[u,e]}}}
+  if(dist[dst]===Infinity)return null;const edges=[];let c=dst;
+  while(c!=src){edges.unshift(prev[c][1]);c=prev[c][0]}
+  return{edges,km:edges.reduce((a,e)=>a+e.d,0),cost:dist[dst]};
+}
+
+// ---------- MAP ----------
+const map=L.map("map").setView([4.313,101.150],13);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"© OpenStreetMap"}).addTo(map);
+const roadL=L.layerGroup().addTo(map),routeL=L.layerGroup().addTo(map);
+Object.entries(N).forEach(([k,n])=>L.circleMarker([n[1],n[2]],{radius:5,color:"#333",fillOpacity:1}).bindTooltip(n[0]).addTo(map));
+function drawRoads(){roadL.clearLayers();E.forEach(e=>{const s=status(e);
+  L.polyline([[N[e[0]][1],N[e[0]][2]],[N[e[1]][1],N[e[1]][2]]],{color:COL[s],weight:5,opacity:.6,dashArray:s==="FLOODED"?"4 8":null})
+   .bindTooltip(e[2]+" – "+s).addTo(roadL)})}
+
+// ---------- UI ----------
+const $=id=>document.getElementById(id),sim=$("sim");
+const opts=Object.entries(N).map(([k,n])=>`<option value="${k}">${n[0]}</option>`).join("");
+$("from").innerHTML=opts;$("to").innerHTML=opts;$("from").value=1;$("to").value=8;
+$("rroad").innerHTML=E.map(e=>`<option value="${e.id}">${e[2]}</option>`).join("");
+const nameOf=id=>E.find(e=>e.id===id)[2];
+const poly=(r,style)=>r.edges.forEach(e=>L.polyline([[N[e[0]][1],N[e[0]][2]],[N[e[1]][1],N[e[1]][2]]],style).addTo(routeL));
+
+function findRoute(){
+  routeL.clearLayers();const a=$("from").value,b=$("to").value,R=$("result");
+  if(a===b){R.innerHTML='<div class="box warn">Pick different points.</div>';return}
+  const normal=dijkstra(a,b,false),aware=dijkstra(a,b,true);
+  if(!aware){R.innerHTML='<div class="box bad">No available route: all paths contain flooded roads.</div>';
+    if(normal)poly(normal,{color:"#888",weight:4,dashArray:"6 6"});return}
+  const hit=normal.edges.filter(e=>status(e)==="FLOODED");
+  const caut=aware.edges.filter(e=>status(e)==="CAUTION");
+  if(normal)poly(normal,{color:"#888",weight:4,dashArray:"6 6"});
+  poly(aware,{color:"#0b6bcb",weight:7});
+  let h=`<div class="box ${hit.length?"warn":"ok"}">`;
+  h+=hit.length?`⚠ Normal route (${normal.km.toFixed(1)} km, grey) passes flooded: <b>${hit.map(e=>e[2]).join(", ")}</b>.<br><b>Alternative (blue): ${aware.km.toFixed(1)} km.</b>`
+   :`✔ Normal route has no flooded road: ${aware.km.toFixed(1)} km.`;
+  if(caut.length)h+=`<br>Caution roads on route: ${caut.map(e=>e[2]).join(", ")}`;
+  R.innerHTML=h+"</div>";
+}
+function refresh(){drawRoads();const c={PASSABLE:0,CAUTION:0,FLOODED:0};E.forEach(e=>c[status(e)]++);
+  $("stats").innerHTML=`<div class="box info">Flooded: <b>${c.FLOODED}</b> · Caution: <b>${c.CAUTION}</b> · Passable: <b>${c.PASSABLE}</b></div>`;
+  $("log").innerHTML=S.log.slice(-8).reverse().map(r=>`<tr><td>${new Date(r.t).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})}</td><td>${nameOf(r.road)}</td><td><span class="tag" style="background:${COL[r.s]}">${r.s}</span></td><td>${r.l??""}</td></tr>`).join("")}
+$("go").onclick=findRoute;sim.onchange=()=>{refresh();findRoute()};
+$("rsub").onclick=()=>{const road=$("rroad").value,s=$("rstat").value;
+  S.st[road]=s;S.log.push({t:new Date().toISOString(),road,s,l:parseFloat($("rlvl").value)||null,by:$("rby").value});save();refresh();findRoute()};
+$("reset").onclick=()=>{S=seed();save();refresh();findRoute()};
+
+// ---------- MET MALAYSIA via data.gov.my ----------
+// Check the live field names at https://developer.data.gov.my/ (weather/warning) and adjust if needed.
+fetch("https://api.data.gov.my/weather/warning?limit=100").then(r=>r.json()).then(list=>{
+  const hits=(Array.isArray(list)?list:[]).filter(w=>/perak/i.test(JSON.stringify(w)));
+  const flood=hits.filter(w=>/banjir|flood|hujan lebat|heavy rain|thunderstorm/i.test(JSON.stringify(w)));
+  metActive=flood.length>0;
+  const t=(flood[0]||hits[0]||{});const title=t.warning_issue?.title_en||t.text_en||"";
+  $("met").className="box "+(metActive?"warn":"ok");
+  $("met").innerHTML=metActive?`⚠ MET warning for Perak: ${String(title).slice(0,120)}<br>Low-lying roads treated as CAUTION.`:"✔ No active MET rain/flood warning for Perak.";
+  refresh();findRoute();
+}).catch(()=>{$("met").className="box info";$("met").textContent="MET API unreachable (offline/blocked). Use the simulate checkbox."});
+refresh();findRoute();
+</script></body></html>
